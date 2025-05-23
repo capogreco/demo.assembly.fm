@@ -10,8 +10,11 @@ const TWILIO_AUTH_TOKEN = Deno.env.get ("TWILIO_AUTH_TOKEN")
 // get TURN credentials from Twilio
 async function get_turn_credentials () {
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+        console.log("Twilio credentials not found in environment")
         return null
     }
+    
+    console.log(`Fetching TURN credentials with Account SID: ${TWILIO_ACCOUNT_SID.substring(0, 8)}...`)
     
     try {
         const auth = btoa (`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`)
@@ -28,10 +31,13 @@ async function get_turn_credentials () {
         
         if (!response.ok) {
             console.error (`Twilio error: ${response.status}`)
+            const errorText = await response.text()
+            console.error(`Twilio error response: ${errorText}`)
             return null
         }
         
         const data = await response.json ()
+        console.log("Twilio response:", JSON.stringify(data, null, 2))
         return data.ice_servers
     } catch (error) {
         console.error (`Error fetching TURN credentials: ${error}`)

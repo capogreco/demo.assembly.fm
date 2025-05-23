@@ -1,426 +1,684 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-    <title>Synth - Minimal Distributed Synth</title>
-    <meta charset="utf-8">
-    <style>
-        body {
-            font-family: monospace;
-            padding: 20px;
-            max-width: 600px;
-            margin: 0 auto;
-            background: #1a1a1a;
-            color: #f0f0f0;
-        }
-        #status {
-            padding: 10px;
-            background: #333;
-            border-radius: 4px;
-            margin-bottom: 20px;
-        }
-        #visualizer {
-            width: 100%;
-            height: 200px;
-            background: #000;
-            border-radius: 4px;
-            margin: 20px 0;
-        }
-        .param {
-            padding: 10px;
-            margin: 10px 0;
-            background: #2a2a2a;
-            border-radius: 4px;
-        }
-        button {
-            padding: 10px 20px;
-            background: #444;
-            border: none;
-            color: white;
-            border-radius: 4px;
-            cursor: pointer;
-            font-family: monospace;
-        }
-        button:hover {
-            background: #555;
-        }
-    </style>
-</head>
-<body>
-    <h1>Synth</h1>
-    
-    <div id="status">Disconnected</div>
-    
-    <div id="controllers" style="margin-top: 20px;">
-        <h3>Connected Controllers</h3>
-        <div id="controller_list" style="padding: 10px; background: #2a2a2a; border-radius: 4px;">None</div>
-    </div>
-    
-    <button id="start_audio">Start Audio</button>
-    
-    <canvas id="visualizer"></canvas>
-    
-    <div id="params">
-        <div class="param">Volume: <span id="volume_display">0.5</span></div>
-    </div>
+    <head>
+        <title>FM Formant Synth - Minimal Distributed Synth</title>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <style>
+            body {
+                font-family: monospace;
+                padding: 20px;
+                max-width: 800px;
+                margin: 0 auto;
+                background: #1a1a1a;
+                color: #fff;
+            }
 
-    <script>
-        const synth_id = `synth-${Math.random ().toString (36).substr (2, 9)}`
-        let ws = null
-        let audio_context = null
-        let pink_noise = null
-        let gain_node = null
-        let analyser = null
-        const controllers = new Map ()
-        let stored_volume = 0.5  // store volume separately from gain
-        let is_powered_on = true  // track power state
-        
-        // webrtc configuration
-        let rtc_config = {
-            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-        }
-        
-        // fetch ice servers from server
-        async function fetch_ice_servers () {
-            try {
-                const response = await fetch ("/ice-servers")
-                const data = await response.json ()
-                rtc_config.iceServers = data.ice_servers
-                console.log ("ICE servers loaded:", rtc_config.iceServers)
-            } catch (error) {
-                console.error ("Failed to fetch ICE servers, using defaults:", error)
+            #audio_overlay {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: #1a1a1a;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                z-index: 1000;
+                cursor: pointer;
             }
-        }
-        
-        // ui elements
-        const status_el = document.getElementById ("status")
-        const start_button = document.getElementById ("start_audio")
-        const volume_display = document.getElementById ("volume_display")
-        const canvas = document.getElementById ("visualizer")
-        const ctx = canvas.getContext ("2d")
-        
-        // set canvas size
-        canvas.width = canvas.offsetWidth
-        canvas.height = canvas.offsetHeight
-        
-        // connect to websocket
-        function connect_websocket () {
-            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
-            ws = new WebSocket (`${protocol}//${window.location.host}/ws`)
-            
-            ws.addEventListener ("open", () => {
-                console.log ("connected to server")
-                status_el.textContent = `Connected as ${synth_id}`
-                
-                // register with server
-                send_message ({
-                    type: "register",
-                    client_id: synth_id
-                })
-                
-                // announce presence to controllers
-                send_message ({
-                    type: "announce",
-                    source: synth_id,
-                    target: "ctrl-*"
-                })
-            })
-            
-            ws.addEventListener ("message", async (event) => {
-                const message = JSON.parse (event.data)
-                await handle_message (message)
-            })
-            
-            ws.addEventListener ("close", () => {
-                console.log ("disconnected from server")
-                status_el.textContent = "Disconnected - Reconnecting..."
-                setTimeout (connect_websocket, 2000)
-            })
-        }
-        
-        // send message via websocket
-        function send_message (message) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send (JSON.stringify (message))
+
+            #audio_overlay h2 {
+                color: #fff;
+                font-size: 1.5em;
+                margin-bottom: 20px;
+                text-align: center;
+                font-weight: normal;
             }
-        }
-        
-        // handle incoming messages
-        async function handle_message (message) {
-            console.log ("received:", message)
-            
-            if (message.type === "announce" && message.source.startsWith ("ctrl-")) {
-                // controller announced itself, respond
-                send_message ({
-                    type: "announce",
-                    source: synth_id,
-                    target: message.source
-                })
-                update_controller_list ()
-                
-            } else if (message.type === "offer") {
-                // handle webrtc offer from controller
-                await handle_offer (message)
-                
-            } else if (message.type === "answer") {
-                // shouldn't receive answers as synth
-                console.warn ("synth received unexpected answer")
-                
-            } else if (message.type === "ice") {
-                // handle ice candidate
-                const controller = controllers.get (message.source)
-                if (controller && controller.connection) {
-                    try {
-                        if (controller.connection.remoteDescription) {
-                            console.log (`adding ice candidate: ${message.data.candidate}`)
-                            await controller.connection.addIceCandidate (message.data)
-                        } else {
-                            // queue ice candidate until remote description is set
-                            console.log ("queueing ice candidate")
-                            if (!controller.ice_queue) controller.ice_queue = []
-                            controller.ice_queue.push (message.data)
-                        }
-                    } catch (error) {
-                        console.error ("error adding ice candidate:", error)
-                    }
+
+            #audio_overlay p {
+                font-size: 0.9em;
+                color: #888;
+                text-align: center;
+                max-width: 400px;
+                margin: 5px 20px;
+            }
+            h1 {
+                color: #4caf50;
+            }
+            #status {
+                padding: 10px;
+                background: #333;
+                border-radius: 4px;
+                margin-bottom: 20px;
+            }
+            #controllers {
+                margin-top: 20px;
+            }
+            .controller {
+                padding: 10px;
+                margin: 5px 0;
+                background: #444;
+                border-radius: 4px;
+            }
+            #analyzer {
+                width: 100%;
+                height: 200px;
+                background: #000;
+                border: 1px solid #444;
+                border-radius: 4px;
+                margin-top: 20px;
+            }
+            #touch_info {
+                padding: 10px;
+                background: #333;
+                border-radius: 4px;
+                margin-top: 20px;
+                font-size: 0.9em;
+            }
+            .param {
+                display: inline-block;
+                margin-right: 20px;
+            }
+            .value {
+                color: #4caf50;
+                font-weight: bold;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>FM Formant Synthesizer</h1>
+
+        <div id="status">Initializing...</div>
+
+        <canvas id="analyzer"></canvas>
+
+        <div id="touch_info">
+            <div class="param">
+                Pitch: <span class="value" id="pitch_value">-</span> Hz
+            </div>
+            <div class="param">
+                Vowel: <span class="value" id="vowel_value">-</span>
+            </div>
+            <div class="param">
+                Status: <span class="value" id="synth_status">Silent</span>
+            </div>
+        </div>
+
+        <div id="controllers">
+            <h3>Connected Controllers</h3>
+            <div id="controller_list">None connected</div>
+        </div>
+
+        <div id="audio_overlay">
+            <h2>click to enable audio</h2>
+            <p>audio context requires user interaction</p>
+        </div>
+
+        <script>
+            const synth_id = `synth-${Math.random().toString(36).substr(2, 9)}`;
+            const peers = new Map();
+            let ws = null;
+            let audio_context = null;
+            let fm_synth_node = null;
+            let gain_node = null;
+            let analyzer_node = null;
+            let canvas = null;
+            let canvas_ctx = null;
+            let animation_id = null;
+
+            // UI elements
+            const status_el = document.getElementById("status");
+            const controller_list_el =
+                document.getElementById("controller_list");
+            const pitch_value_el = document.getElementById("pitch_value");
+            const vowel_value_el = document.getElementById("vowel_value");
+            const synth_status_el = document.getElementById("synth_status");
+
+            // WebRTC configuration
+            let rtc_config = {
+                iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+            };
+
+            // Vowel names for display
+            const vowel_names = ["a", "æ", "e", "i", "o", "u"];
+
+            // Fetch ICE servers
+            async function fetch_ice_servers() {
+                try {
+                    const response = await fetch("/ice-servers");
+                    const data = await response.json();
+                    rtc_config.iceServers = data.ice_servers;
+                    console.log("ICE servers loaded:", rtc_config.iceServers);
+                } catch (error) {
+                    console.error("Failed to fetch ICE servers:", error);
                 }
             }
-        }
-        
 
-        
-        // initialize audio
-        async function init_audio () {
-            audio_context = new (window.AudioContext || window.webkitAudioContext) ()
-            
-            // load audio worklet
-            await audio_context.audioWorklet.addModule ("pink_noise.js")
-            
-            // create nodes
-            pink_noise = new AudioWorkletNode (audio_context, "ridge-rat-type2-pink-noise-generator")
-            gain_node = audio_context.createGain ()
-            analyser = audio_context.createAnalyser ()
-            
-            // connect nodes
-            pink_noise.connect (gain_node)
-            gain_node.connect (analyser)
-            analyser.connect (audio_context.destination)
-            
-            // set initial volume based on power state
-            gain_node.gain.value = is_powered_on ? stored_volume : 0
-            
-            // set pink noise amplitude
-            pink_noise.parameters.get ("amplitude").value = 0.5
-            
-            start_button.textContent = "Audio Running"
-            start_button.disabled = true
-            
-            // start visualizer
-            draw_visualizer ()
-        }
-        
-        // visualizer
-        function draw_visualizer () {
-            requestAnimationFrame (draw_visualizer)
-            
-            if (!analyser) return
-            
-            const buffer_length = analyser.frequencyBinCount
-            const data_array = new Uint8Array (buffer_length)
-            analyser.getByteFrequencyData (data_array)
-            
-            ctx.fillStyle = "rgb(0, 0, 0)"
-            ctx.fillRect (0, 0, canvas.width, canvas.height)
-            
-            const bar_width = (canvas.width / buffer_length) * 2.5
-            let bar_height
-            let x = 0
-            
-            for (let i = 0; i < buffer_length; i++) {
-                bar_height = (data_array[i] / 255) * canvas.height
+            // Initialize audio
+            async function init_audio() {
+                try {
+                    audio_context = new (window.AudioContext ||
+                        window.webkitAudioContext)();
+
+                    // Load FM formant processor
+                    await audio_context.audioWorklet.addModule(
+                        "fm_formant_processor.js",
+                    );
+
+                    // Create nodes
+                    fm_synth_node = new AudioWorkletNode(
+                        audio_context,
+                        "fm-formant-processor",
+                    );
+
+                    // Initialize AudioParam values
+                    fm_synth_node.parameters.get('frequency').value = 220
+                    fm_synth_node.parameters.get('gain').value = 0.001  // Start silent
                 
-                ctx.fillStyle = `rgb(${bar_height + 100}, 50, 50)`
-                ctx.fillRect (x, canvas.height - bar_height, bar_width, bar_height)
+                    // Initialize formant parameters to default 'a' vowel
+                    fm_synth_node.parameters.get('formant0_freq').value = 700
+                    fm_synth_node.parameters.get('formant0_amp').value = 1.0
+                    fm_synth_node.parameters.get('formant0_bw').value = 0.1
                 
-                x += bar_width + 1
+                    fm_synth_node.parameters.get('formant1_freq').value = 1220
+                    fm_synth_node.parameters.get('formant1_amp').value = 0.5
+                    fm_synth_node.parameters.get('formant1_bw').value = 0.1
+                
+                    fm_synth_node.parameters.get('formant2_freq').value = 2600
+                    fm_synth_node.parameters.get('formant2_amp').value = 0.16
+                    fm_synth_node.parameters.get('formant2_bw').value = 0.15
+                
+                    fm_synth_node.parameters.get('formant3_freq').value = 3300
+                    fm_synth_node.parameters.get('formant3_amp').value = 0.1
+                    fm_synth_node.parameters.get('formant3_bw').value = 0.2
+
+                    gain_node = audio_context.createGain();
+                    analyzer_node = audio_context.createAnalyser();
+
+                    // Set up analyzer
+                    analyzer_node.fftSize = 2048;
+                    analyzer_node.smoothingTimeConstant = 0.8;
+
+                    // Connect audio graph
+                    fm_synth_node.connect(gain_node);
+                    gain_node.connect(analyzer_node);
+                    analyzer_node.connect(audio_context.destination);
+
+                    // Set initial gain
+                    gain_node.gain.value = 0.5;
+
+                    // Set up canvas for visualization
+                    canvas = document.getElementById("analyzer");
+                    canvas_ctx = canvas.getContext("2d");
+                    canvas.width = canvas.offsetWidth;
+                    canvas.height = canvas.offsetHeight;
+
+                    // Start visualization
+                    draw_spectrum();
+
+                    console.log("Audio initialized");
+                    return true;
+                } catch (error) {
+                    console.error("Audio initialization failed:", error);
+                    status_el.textContent = "Audio initialization failed";
+                    return false;
+                }
             }
-        }
-        
-        // handle webrtc offer
-        async function handle_offer (message) {
-            console.log (`handling offer from ${message.source}`)
-            
-            // create peer connection
-            const peer_connection = new RTCPeerConnection (rtc_config)
-            
-            // store controller info
-            const controller = {
-                connection: peer_connection,
-                param_channel: null,
-                command_channel: null,
-                ice_queue: []
+
+            // Draw spectrum analyzer
+            function draw_spectrum() {
+                animation_id = requestAnimationFrame(draw_spectrum);
+
+                const buffer_length = analyzer_node.frequencyBinCount;
+                const data_array = new Uint8Array(buffer_length);
+                analyzer_node.getByteFrequencyData(data_array);
+
+                canvas_ctx.fillStyle = "rgb(0, 0, 0)";
+                canvas_ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                const bar_width = (canvas.width / buffer_length) * 2.5;
+                let bar_height;
+                let x = 0;
+
+                for (let i = 0; i < buffer_length; i++) {
+                    bar_height = (data_array[i] / 255) * canvas.height;
+
+                    const r = bar_height + 25;
+                    const g = 250 - bar_height;
+                    const b = 50;
+
+                    canvas_ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+                    canvas_ctx.fillRect(
+                        x,
+                        canvas.height - bar_height,
+                        bar_width,
+                        bar_height,
+                    );
+
+                    x += bar_width + 1;
+                }
             }
-            controllers.set (message.source, controller)
-            
-            // handle ice candidates
-            peer_connection.addEventListener ("icecandidate", (event) => {
-                if (event.candidate) {
-                    console.log (`sending ice candidate: ${event.candidate.candidate}`)
-                    send_message ({
-                        type: "ice",
+
+            // Connect to WebSocket
+            function connect_websocket() {
+                const protocol =
+                    window.location.protocol === "https:" ? "wss:" : "ws:";
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+                ws.addEventListener("open", () => {
+                    console.log("Connected to server");
+                    status_el.textContent = `Connected as ${synth_id}`;
+
+                    send_message({
+                        type: "register",
+                        client_id: synth_id,
+                    });
+
+                    send_message({
+                        type: "announce",
                         source: synth_id,
-                        target: message.source,
-                        data: event.candidate
-                    })
+                        target: "ctrl-*",
+                    });
+
+                    send_message({
+                        type: "announce",
+                        source: synth_id,
+                        target: "touch-ctrl-*",
+                    });
+                });
+
+                ws.addEventListener("message", async (event) => {
+                    const message = JSON.parse(event.data);
+                    await handle_message(message);
+                });
+
+                ws.addEventListener("close", () => {
+                    console.log("Disconnected from server");
+                    status_el.textContent = "Disconnected - Reconnecting...";
+                    setTimeout(connect_websocket, 2000);
+                });
+            }
+
+            // Send message via WebSocket
+            function send_message(message) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify(message));
+                }
+            }
+
+            // Handle incoming messages
+            async function handle_message(message) {
+                console.log("Received:", message);
+
+                if (
+                    message.type === "announce" &&
+                    (message.source.startsWith("ctrl-") ||
+                        message.source.startsWith("touch-ctrl-"))
+                ) {
+                    update_controller_list(message.source, "discovered");
+                } else if (message.type === "offer") {
+                    await handle_offer(message);
+                } else if (message.type === "ice-candidate") {
+                    const peer = peers.get(message.source);
+                    if (peer && peer.connection) {
+                        if (peer.connection.remoteDescription) {
+                            await peer.connection.addIceCandidate(message.data);
+                        } else {
+                            if (!peer.ice_candidates) {
+                                peer.ice_candidates = [];
+                            }
+                            peer.ice_candidates.push(message.data);
+                        }
+                    }
+                }
+            }
+
+            // Handle WebRTC offer
+            async function handle_offer(message) {
+                console.log(`Handling offer from ${message.source}`);
+
+                const connection = new RTCPeerConnection(rtc_config);
+                const peer = {
+                    connection,
+                    ice_candidates: [],
+                };
+
+                peers.set(message.source, peer);
+
+                connection.addEventListener("datachannel", (event) => {
+                    const channel = event.channel;
+                    console.log(`Data channel received: ${channel.label}`);
+
+                    channel.addEventListener("open", () => {
+                        console.log(`Channel ${channel.label} opened`);
+                        update_controller_list(message.source, "connected");
+                    });
+
+                    channel.addEventListener("message", (event) => {
+                        const data = JSON.parse(event.data);
+
+                        if (data.type === "ping") {
+                            channel.send(
+                                JSON.stringify({
+                                    type: "pong",
+                                    timestamp: data.timestamp,
+                                }),
+                            );
+                        } else if (data.type === "touch") {
+                            handle_touch_data(data);
+                        } else if (data.type === "param") {
+                            handle_param(data.name, data.value);
+                        } else if (data.type === "command") {
+                            handle_command(data.name, data.value);
+                        }
+                    });
+
+                    channel.addEventListener("close", () => {
+                        console.log(`Channel ${channel.label} closed`);
+                        update_controller_list(message.source, "disconnected");
+                    });
+                });
+
+                connection.addEventListener("icecandidate", (event) => {
+                    if (event.candidate) {
+                        send_message({
+                            type: "ice-candidate",
+                            source: synth_id,
+                            target: message.source,
+                            data: event.candidate,
+                        });
+                    }
+                });
+
+                await connection.setRemoteDescription(message.data);
+
+                if (peer.ice_candidates) {
+                    for (const candidate of peer.ice_candidates) {
+                        await connection.addIceCandidate(candidate);
+                    }
+                    peer.ice_candidates = [];
+                }
+
+                const answer = await connection.createAnswer();
+                await connection.setLocalDescription(answer);
+
+                send_message({
+                    type: "answer",
+                    source: synth_id,
+                    target: message.source,
+                    data: answer,
+                });
+            }
+
+            // Handle touch data
+            function handle_touch_data(data) {
+                if (!fm_synth_node) return;
+
+                if (data.active) {
+                    const ramp_time = 0.1;
+
+                    // Map X coordinate to pitch (110Hz to 880Hz, exponential)
+                    const min_pitch = 110;
+                    const max_pitch = 880;
+                    const pitch =
+                        min_pitch * Math.pow(max_pitch / min_pitch, data.x);
+
+                    // Use AudioParam for smooth pitch changes
+                    const now = audio_context.currentTime;
+                    fm_synth_node.parameters
+                        .get("frequency")
+                        .cancelScheduledValues(now);
+                    fm_synth_node.parameters
+                        .get("frequency")
+                        .setValueAtTime(
+                            fm_synth_node.parameters.get("frequency").value,
+                            now,
+                        );
+                    fm_synth_node.parameters
+                        .get("frequency")
+                        .exponentialRampToValueAtTime(
+                            pitch,
+                            now + 0.02, // 20ms ramp
+                        );
+
+                    // Calculate formant values for current vowel position
+                    // Note: We need to duplicate the getVowelFormants logic here since we can't call static methods from the worklet
+                    const vowelFormants = [
+                        // 'a' as in "father"
+                        {
+                            formants: [
+                                { freq: 700, amp: 1.0, bw: 0.1 },
+                                { freq: 1220, amp: 0.5, bw: 0.1 },
+                                { freq: 2600, amp: 0.16, bw: 0.15 },
+                                { freq: 3300, amp: 0.1, bw: 0.2 },
+                            ],
+                        },
+                        // 'e' as in "bed"
+                        {
+                            formants: [
+                                { freq: 530, amp: 1.0, bw: 0.1 },
+                                { freq: 1840, amp: 0.32, bw: 0.15 },
+                                { freq: 2480, amp: 0.2, bw: 0.2 },
+                                { freq: 3520, amp: 0.1, bw: 0.2 },
+                            ],
+                        },
+                        // 'i' as in "beet"
+                        {
+                            formants: [
+                                { freq: 270, amp: 1.0, bw: 0.1 },
+                                { freq: 2290, amp: 0.25, bw: 0.2 },
+                                { freq: 3010, amp: 0.16, bw: 0.2 },
+                                { freq: 3300, amp: 0.1, bw: 0.2 },
+                            ],
+                        },
+                        // 'o' as in "boat"
+                        {
+                            formants: [
+                                { freq: 570, amp: 1.0, bw: 0.1 },
+                                { freq: 840, amp: 0.63, bw: 0.1 },
+                                { freq: 2410, amp: 0.1, bw: 0.2 },
+                                { freq: 3400, amp: 0.05, bw: 0.2 },
+                            ],
+                        },
+                        // 'u' as in "boot"
+                        {
+                            formants: [
+                                { freq: 300, amp: 1.0, bw: 0.1 },
+                                { freq: 870, amp: 0.32, bw: 0.1 },
+                                { freq: 2240, amp: 0.08, bw: 0.2 },
+                                { freq: 3400, amp: 0.04, bw: 0.2 },
+                            ],
+                        },
+                    ];
+
+                    // Interpolate between vowels
+                    const scaledPos = data.y * (vowelFormants.length - 1)
+                    const lowerIndex = Math.floor(scaledPos);
+                    const upperIndex = Math.min(
+                        lowerIndex + 1,
+                        vowelFormants.length - 1,
+                    );
+                    const fraction = scaledPos - lowerIndex;
+
+                    const lowerVowel = vowelFormants[lowerIndex].formants;
+                    const upperVowel = vowelFormants[upperIndex].formants;
+
+                    // Schedule AudioParam automation for each formant
+                    for (let i = 0; i < 4; i++) {
+                        // Interpolate formant values
+                        const freq =
+                            lowerVowel[i].freq +
+                            (upperVowel[i].freq - lowerVowel[i].freq) *
+                                fraction;
+                        const amp =
+                            lowerVowel[i].amp +
+                            (upperVowel[i].amp - lowerVowel[i].amp) * fraction;
+                        const bw =
+                            lowerVowel[i].bw +
+                            (upperVowel[i].bw - lowerVowel[i].bw) * fraction;
+
+                        // Frequency - use exponential ramp
+                        const freqParam = fm_synth_node.parameters.get(
+                            `formant${i}_freq`,
+                        );
+                        // freqParam.cancelScheduledValues(now);
+                        freqParam.setValueAtTime(freqParam.value, now);
+                        freqParam.cancelScheduledValues(now);
+                        freqParam.exponentialRampToValueAtTime(
+                            freq,
+                            now + ramp_time,
+                        );
+
+                        // Amplitude - use linear ramp
+                        const ampParam = fm_synth_node.parameters.get(
+                            `formant${i}_amp`,
+                        );
+                        // ampParam.cancelScheduledValues(now);
+                        ampParam.setValueAtTime(ampParam.value, now);
+                        ampParam.cancelScheduledValues(now);
+                        ampParam.linearRampToValueAtTime(amp, now + ramp_time);
+
+                        // Bandwidth - use linear ramp
+                        const bwParam = fm_synth_node.parameters.get(
+                            `formant${i}_bw`,
+                        );
+                        // bwParam.cancelScheduledValues(now);
+                        bwParam.setValueAtTime(bwParam.value, now);
+                        bwParam.cancelScheduledValues(now);
+                        bwParam.linearRampToValueAtTime(bw, now + ramp_time);
+                    }
+
+                    // Activate synthesis
+                    fm_synth_node.port.postMessage({
+                        type: "param",
+                        name: "active",
+                        value: true,
+                    });
+
+                    // Smoothly bring up gain
+                    fm_synth_node.parameters
+                        .get("gain")
+                        .cancelScheduledValues(now);
+                    fm_synth_node.parameters
+                        .get("gain")
+                        .setValueAtTime(
+                            fm_synth_node.parameters.get("gain").value,
+                            now,
+                        );
+                    fm_synth_node.parameters
+                        .get("gain")
+                        .exponentialRampToValueAtTime(0.1, now + 0.02);
+
+                    // Update UI
+                    pitch_value_el.textContent = Math.round(pitch);
+                    const vowel_index = Math.min(
+                        Math.floor(data.y * vowel_names.length),
+                        vowel_names.length - 1,
+                    );
+                    vowel_value_el.textContent = vowel_names[vowel_index];
+                    synth_status_el.textContent = "Singing";
+
+                    // Resume audio context if needed
+                    if (audio_context.state === "suspended") {
+                        audio_context.resume();
+                    }
                 } else {
-                    console.log ("ice gathering complete")
-                }
-            })
-            
-            // monitor ice connection state
-            peer_connection.addEventListener ("iceconnectionstatechange", () => {
-                console.log (`ice connection state: ${peer_connection.iceConnectionState}`)
-                update_controller_list ()
-            })
-            
-            // monitor ice gathering state  
-            peer_connection.addEventListener ("icegatheringstatechange", () => {
-                console.log (`ice gathering state: ${peer_connection.iceGatheringState}`)
-            })
-            
-            // clean up on connection failure
-            peer_connection.addEventListener ("connectionstatechange", () => {
-                if (peer_connection.connectionState === "failed" || peer_connection.connectionState === "closed") {
-                    controllers.delete (message.source)
-                    update_controller_list ()
-                }
-            })
-            
-            // handle data channels
-            peer_connection.addEventListener ("datachannel", (event) => {
-                const channel = event.channel
-                
-                if (channel.label === "params") {
-                    controller.param_channel = channel
-                    
-                    channel.addEventListener ("open", () => {
-                        console.log ("param channel open")
-                        status_el.textContent = `Connected as ${synth_id}`
-                        update_controller_list ()
-                    })
-                    
-                    channel.addEventListener ("message", (event) => {
-                        const data = JSON.parse (event.data)
-                        if (data.type === "param") {
-                            update_param (data.name, data.value, message.source)
-                        } else if (data.type === "ping") {
-                            // respond with pong
-                            channel.send (JSON.stringify ({
-                                type: "pong",
-                                timestamp: data.timestamp
-                            }))
-                        }
-                    })
-                    
-                    channel.addEventListener ("close", () => {
-                        console.log ("param channel closed")
-                        update_controller_list ()
-                    })
-                    
-                } else if (channel.label === "commands") {
-                    controller.command_channel = channel
-                    
-                    channel.addEventListener ("open", () => {
-                        console.log ("command channel open")
-                    })
-                    
-                    channel.addEventListener ("message", (event) => {
-                        const data = JSON.parse (event.data)
-                        if (data.type === "command") {
-                            handle_command (data.name, data.value, message.source)
-                        }
-                    })
-                }
-            })
-            
-            // set remote description and create answer
-            await peer_connection.setRemoteDescription (message.data)
-            const answer = await peer_connection.createAnswer ()
-            await peer_connection.setLocalDescription (answer)
-            
-            // process any queued ice candidates
-            if (controller.ice_queue && controller.ice_queue.length > 0) {
-                console.log (`processing ${controller.ice_queue.length} queued ice candidates`)
-                for (const candidate of controller.ice_queue) {
-                    try {
-                        await peer_connection.addIceCandidate (candidate)
-                    } catch (error) {
-                        console.error ("error adding queued ice candidate:", error)
-                    }
-                }
-                controller.ice_queue = []
-            }
-            
-            // send answer back
-            send_message ({
-                type: "answer",
-                source: synth_id,
-                target: message.source,
-                data: answer
-            })
-        }
-        
-        // handle parameter updates
-        function update_param (name, value, source) {
-            console.log (`param ${name} = ${value} from ${source}`)
-            if (name === "volume") {
-                stored_volume = value
-                volume_display.textContent = value.toFixed (2)
-                if (gain_node && is_powered_on) {
-                    gain_node.gain.value = value
+                    // Stop synthesis
+                    fm_synth_node.port.postMessage({
+                        type: "param",
+                        name: "active",
+                        value: false,
+                    });
+
+                    // Smoothly fade out gain
+                    const now = audio_context.currentTime;
+                    fm_synth_node.parameters
+                        .get("gain")
+                        .cancelScheduledValues(now);
+                    fm_synth_node.parameters
+                        .get("gain")
+                        .setValueAtTime(
+                            fm_synth_node.parameters.get("gain").value,
+                            now,
+                        );
+                    fm_synth_node.parameters
+                        .get("gain")
+                        .exponentialRampToValueAtTime(
+                            0.001, // Can't ramp to 0 with exponential
+                            now + 0.1,
+                        );
+
+                    pitch_value_el.textContent = "-";
+                    vowel_value_el.textContent = "-";
+                    synth_status_el.textContent = "Silent";
                 }
             }
-        }
-        
-        // handle command updates
-        function handle_command (name, value, source) {
-            console.log (`command ${name} = ${value} from ${source}`)
-            if (name === "power") {
-                is_powered_on = value
-                if (gain_node) {
-                    if (value) {
-                        // power on - restore stored volume
-                        gain_node.gain.value = stored_volume
-                    } else {
-                        // power off - mute
-                        gain_node.gain.value = 0
+
+            // Handle parameter updates
+            function handle_param(name, value) {
+                if (name === "volume" && gain_node) {
+                    gain_node.gain.value = value;
+                }
+            }
+
+            // Handle commands
+            function handle_command(name, value) {
+                if (name === "power") {
+                    if (value && audio_context.state === "suspended") {
+                        audio_context.resume();
+                    } else if (!value && audio_context.state === "running") {
+                        audio_context.suspend();
                     }
                 }
             }
-        }
-        
-        // update controller list ui
-        function update_controller_list () {
-            const controller_list_el = document.getElementById ("controller_list")
-            const connected_controllers = Array.from (controllers.entries ()).filter (
-                ([id, ctrl]) => ctrl.connection && ctrl.connection.iceConnectionState === "connected"
-            )
-            
-            if (connected_controllers.length === 0) {
-                controller_list_el.textContent = "None"
-            } else {
-                controller_list_el.innerHTML = connected_controllers.map (([id, ctrl]) => 
-                    `<div style="margin: 2px 0;">${id}</div>`
-                ).join ("")
+
+            // Update controller list
+            function update_controller_list(controller_id, status) {
+                const controllers = Array.from(peers.keys());
+                if (controllers.length === 0) {
+                    controller_list_el.innerHTML = "None connected";
+                } else {
+                    controller_list_el.innerHTML = controllers
+                        .map((id) => `<div class="controller">${id}</div>`)
+                        .join("");
+                }
             }
-        }
-        
-        // start audio on user gesture
-        start_button.addEventListener ("click", init_audio)
-        
-        // start connection
-        fetch_ice_servers ().then (() => {
-            connect_websocket ()
-        })
-    </script>
-</body>
+
+            // Initialize network immediately
+            async function init_network() {
+                await fetch_ice_servers();
+                connect_websocket();
+            }
+
+            // Initialize audio on user gesture
+            async function init_audio_on_gesture() {
+                // Hide overlay
+                const overlay = document.getElementById("audio_overlay");
+                if (overlay) {
+                    overlay.style.display = "none";
+                }
+
+                const audio_ok = await init_audio();
+                if (!audio_ok) {
+                    status_el.textContent =
+                        "Audio initialization failed - click to retry";
+                    document.addEventListener("click", init_audio_on_gesture, {
+                        once: true,
+                    });
+                }
+            }
+
+            // Start network immediately
+            init_network();
+
+            // Wait for user gesture for audio
+            document.addEventListener("click", init_audio_on_gesture, {
+                once: true,
+            });
+
+            status_el.textContent = "Waiting for audio permission...";
+        </script>
+    </body>
 </html>
