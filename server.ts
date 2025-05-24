@@ -70,16 +70,65 @@ async function handle_request (request) {
                 connections.delete (old_id)
                 connections.set (client_id, { socket, actual_id: client_id })
                 console.log (`client registered as: ${client_id}`)
+                
+                // Add controller to KV registry
+                if (client_id.startsWith("ctrl-") || client_id.startsWith("touch-ctrl-")) {
+                    await kv.set(["controllers", client_id], {
+                        timestamp: Date.now(),
+                        ws_id: temp_id
+                    }, { expireIn: 60 * 1000 }) // 60 second TTL
+                    
+                    // Notify all synths about new controller
+                    for (const [cid, cinfo] of connections) {
+                        if (cid.startsWith("synth-") && cinfo.socket.readyState === WebSocket.OPEN) {
+                            cinfo.socket.send(JSON.stringify({
+                                type: "controller-joined",
+                                controller_id: client_id,
+                                timestamp: Date.now()
+                            }))
+                        }
+                    }
+                }
+                
                 start_polling_for_client (client_id, socket)
+                return
+            }
+            
+            // handle heartbeat from controllers
+            if (data.type === "heartbeat" && (client_id.startsWith("ctrl-") || client_id.startsWith("touch-ctrl-"))) {
+                await kv.set(["controllers", client_id], {
+                    timestamp: Date.now(),
+                    ws_id: temp_id
+                }, { expireIn: 60 * 1000 }) // refresh TTL
+                return
+            }
+            
+            // handle request for active controllers
+            if (data.type === "request-controllers") {
+                const controllers = []
+                const entries = kv.list({ prefix: ["controllers"] })
+                for await (const entry of entries) {
+                    controllers.push(entry.key[1]) // key is ["controllers", controller_id]
+                }
+                socket.send(JSON.stringify({
+                    type: "controllers-list",
+                    controllers: controllers,
+                    timestamp: Date.now()
+                }))
                 return
             }
             
             await handle_websocket_message (client_id, event.data)
         })
         
-        socket.addEventListener ("close", () => {
+        socket.addEventListener ("close", async () => {
             console.log (`client disconnected: ${client_id}`)
             connections.delete (client_id)
+            
+            // Remove controller from KV registry
+            if (client_id.startsWith("ctrl-") || client_id.startsWith("touch-ctrl-")) {
+                await kv.delete(["controllers", client_id])
+            }
         })
         
         return response

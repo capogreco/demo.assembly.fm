@@ -127,11 +127,6 @@ class FMFormantProcessor extends AudioWorkletProcessor {
                 const fraction = targetRatio - lowerHarmonic
                 const evenWeight = lowerIsEven ? (1 - fraction) : fraction
                 const oddWeight = lowerIsEven ? fraction : (1 - fraction)
-                
-                // Apply power law to reduce time in equal-mix zone (reduces phase artifacts)
-                const power = 3
-                const adjustedEvenWeight = Math.pow(evenWeight, power) / (Math.pow(evenWeight, power) + Math.pow(oddWeight, power))
-                const adjustedOddWeight = 1 - adjustedEvenWeight
 
                 // Generate carriers with FM
                 const modIndex = bw * 2
@@ -146,7 +141,7 @@ class FMFormantProcessor extends AudioWorkletProcessor {
                 const oddCarrier = Math.sin(2 * Math.PI * oddPhase + modSignal)
 
                 // Mix carriers and apply formant amplitude
-                sample += amp * (adjustedEvenWeight * evenCarrier + adjustedOddWeight * oddCarrier)
+                sample += amp * (evenWeight * evenCarrier + oddWeight * oddCarrier)
             }
 
             channel[i] = sample * gain

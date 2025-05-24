@@ -246,11 +246,15 @@
                     client_id: controller_id
                 })
                 
-                send_message({
-                    type: 'announce',
-                    source: controller_id,
-                    target: 'synth-*'
-                })
+                // Start heartbeat to keep alive in KV registry
+                setInterval(() => {
+                    send_message({
+                        type: 'heartbeat',
+                        source: controller_id
+                    })
+                }, 20000) // Send heartbeat every 20 seconds
+                
+                console.log(`Controller registered and heartbeat started`)
             })
             
             ws.addEventListener('message', async (event) => {
@@ -276,12 +280,7 @@
         async function handle_message(message) {
             console.log('Received:', message)
             
-            if (message.type === 'announce' && message.source.startsWith('synth-')) {
-                const existing_peer = peers.get(message.source)
-                if (!existing_peer || !existing_peer.connection) {
-                    await connect_to_synth(message.source)
-                }
-            } else if (message.type === 'answer') {
+            if (message.type === 'answer') {
                 const peer = peers.get(message.source)
                 if (peer && peer.connection) {
                     await peer.connection.setRemoteDescription(message.data)
@@ -293,6 +292,100 @@
                         peer.ice_candidates = []
                     }
                 }
+            } else if (message.type === 'offer') {
+                // Handle offers from synths (when they initiate connection)
+                console.log(`Controller received offer from ${message.source}`)
+                
+                let peer = peers.get(message.source)
+                if (!peer || !peer.connection) {
+                    // Create new peer connection
+                    const connection = new RTCPeerConnection(rtc_config)
+                    peer = { 
+                        connection, 
+                        channels: {},
+                        param_channel: null,
+                        ice_candidates: [],
+                        latency: null,
+                        ping_interval: null
+                    }
+                    peers.set(message.source, peer)
+                    
+                    // Set up connection event handlers
+                    connection.addEventListener('icecandidate', event => {
+                        if (event.candidate) {
+                            send_message({
+                                type: 'ice-candidate',
+                                source: controller_id,
+                                target: message.source,
+                                data: event.candidate
+                            })
+                        }
+                    })
+                    
+                    connection.addEventListener('datachannel', event => {
+                        const channel = event.channel
+                        console.log(`Received data channel: ${channel.label}`)
+                        
+                        channel.addEventListener('open', () => {
+                            console.log(`Channel ${channel.label} opened`)
+                            update_stats()
+                            update_synth_list()
+                        })
+                        
+                        channel.addEventListener('message', (event) => {
+                            try {
+                                const data = JSON.parse(event.data)
+                                if (data.type === 'pong') {
+                                    peer.latency = Date.now() - data.timestamp
+                                    update_stats()
+                                }
+                            } catch (error) {
+                                console.error('Failed to parse channel message:', error)
+                            }
+                        })
+                        
+                        channel.addEventListener('close', () => {
+                            console.log(`Channel ${channel.label} closed`)
+                            if (peer.ping_interval) {
+                                clearInterval(peer.ping_interval)
+                            }
+                            peers.delete(message.source)
+                            update_stats()
+                            update_synth_list()
+                        })
+                        
+                        peer.channels[channel.label] = channel
+                    
+                        // If this is the params channel, set it as the main channel
+                        if (channel.label === 'params') {
+                            peer.param_channel = channel
+                            start_ping(message.source)
+                            console.log(`Controller set up params channel for ${message.source}`)
+                        }
+                    })
+                }
+                
+                // Set remote description and create answer
+                await peer.connection.setRemoteDescription(message.data)
+                
+                // Add any queued ICE candidates
+                if (peer.ice_candidates) {
+                    for (const candidate of peer.ice_candidates) {
+                        await peer.connection.addIceCandidate(candidate)
+                    }
+                    peer.ice_candidates = []
+                }
+                
+                const answer = await peer.connection.createAnswer()
+                await peer.connection.setLocalDescription(answer)
+                
+                send_message({
+                    type: 'answer',
+                    source: controller_id,
+                    target: message.source,
+                    data: answer
+                })
+                console.log(`Controller sent answer to ${message.source}`)
             } else if (message.type === 'ice-candidate') {
                 const peer = peers.get(message.source)
                 if (peer && peer.connection) {
@@ -308,73 +401,7 @@
             }
         }
         
-        // Connect to synth
-        async function connect_to_synth(synth_id) {
-            console.log(`Connecting to ${synth_id}`)
-            
-            const connection = new RTCPeerConnection(rtc_config)
-            const peer = {
-                connection,
-                param_channel: null,
-                ice_candidates: [],
-                latency: null,
-                ping_interval: null
-            }
-            
-            peers.set(synth_id, peer)
-            
-            // Create data channel for parameters (unreliable)
-            peer.param_channel = connection.createDataChannel('params', {
-                ordered: false,
-                maxRetransmits: 0
-            })
-            
-            peer.param_channel.addEventListener('open', () => {
-                console.log(`Param channel open to ${synth_id}`)
-                update_stats()
-                update_synth_list()
-                start_ping(synth_id)
-            })
-            
-            peer.param_channel.addEventListener('message', (event) => {
-                const data = JSON.parse(event.data)
-                if (data.type === 'pong') {
-                    peer.latency = Date.now() - data.timestamp
-                    update_stats()
-                }
-            })
-            
-            connection.addEventListener('icecandidate', (event) => {
-                if (event.candidate) {
-                    send_message({
-                        type: 'ice-candidate',
-                        source: controller_id,
-                        target: synth_id,
-                        data: event.candidate
-                    })
-                }
-            })
-            
-            connection.addEventListener('connectionstatechange', () => {
-                if (connection.connectionState === 'failed' || 
-                    connection.connectionState === 'disconnected' || 
-                    connection.connectionState === 'closed') {
-                    cleanup_peer(synth_id)
-                    update_stats()
-                    update_synth_list()
-                }
-            })
-            
-            const offer = await connection.createOffer()
-            await connection.setLocalDescription(offer)
-            
-            send_message({
-                type: 'offer',
-                source: controller_id,
-                target: synth_id,
-                data: offer
-            })
-        }
+
         
         // Start ping interval
         function start_ping(synth_id) {

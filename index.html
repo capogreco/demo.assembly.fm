@@ -276,17 +276,12 @@
                         client_id: synth_id,
                     });
 
+                    // Request list of active controllers
                     send_message({
-                        type: "announce",
+                        type: "request-controllers",
                         source: synth_id,
-                        target: "ctrl-*",
                     });
-
-                    send_message({
-                        type: "announce",
-                        source: synth_id,
-                        target: "touch-ctrl-*",
-                    });
+                    console.log("Synth requested active controllers list");
                 });
 
                 ws.addEventListener("message", async (event) => {
@@ -312,14 +307,30 @@
             async function handle_message(message) {
                 console.log("Received:", message);
 
-                if (
-                    message.type === "announce" &&
-                    (message.source.startsWith("ctrl-") ||
-                        message.source.startsWith("touch-ctrl-"))
-                ) {
-                    update_controller_list(message.source, "discovered");
-                } else if (message.type === "offer") {
-                    await handle_offer(message);
+                if (message.type === "controllers-list") {
+                    console.log(`Synth received controllers list: ${message.controllers.join(", ")}`);
+                    // Connect to all active controllers
+                    for (const controller_id of message.controllers) {
+                        update_controller_list(controller_id, "discovered");
+                        await initiate_connection_to_controller(controller_id);
+                    }
+                } else if (message.type === "controller-joined") {
+                    console.log(`Synth notified of new controller: ${message.controller_id}`);
+                    update_controller_list(message.controller_id, "discovered");
+                    await initiate_connection_to_controller(message.controller_id);
+                } else if (message.type === "answer") {
+                    const peer = peers.get(message.source);
+                    if (peer && peer.connection) {
+                        await peer.connection.setRemoteDescription(message.data);
+                        
+                        // Add any queued ICE candidates
+                        if (peer.ice_candidates) {
+                            for (const candidate of peer.ice_candidates) {
+                                await peer.connection.addIceCandidate(candidate);
+                            }
+                            peer.ice_candidates = [];
+                        }
+                    }
                 } else if (message.type === "ice-candidate") {
                     const peer = peers.get(message.source);
                     if (peer && peer.connection) {
@@ -335,82 +346,7 @@
                 }
             }
 
-            // Handle WebRTC offer
-            async function handle_offer(message) {
-                console.log(`Handling offer from ${message.source}`);
 
-                const connection = new RTCPeerConnection(rtc_config);
-                const peer = {
-                    connection,
-                    ice_candidates: [],
-                };
-
-                peers.set(message.source, peer);
-
-                connection.addEventListener("datachannel", (event) => {
-                    const channel = event.channel;
-                    console.log(`Data channel received: ${channel.label}`);
-
-                    channel.addEventListener("open", () => {
-                        console.log(`Channel ${channel.label} opened`);
-                        update_controller_list(message.source, "connected");
-                    });
-
-                    channel.addEventListener("message", (event) => {
-                        const data = JSON.parse(event.data);
-
-                        if (data.type === "ping") {
-                            channel.send(
-                                JSON.stringify({
-                                    type: "pong",
-                                    timestamp: data.timestamp,
-                                }),
-                            );
-                        } else if (data.type === "touch") {
-                            handle_touch_data(data);
-                        } else if (data.type === "param") {
-                            handle_param(data.name, data.value);
-                        } else if (data.type === "command") {
-                            handle_command(data.name, data.value);
-                        }
-                    });
-
-                    channel.addEventListener("close", () => {
-                        console.log(`Channel ${channel.label} closed`);
-                        update_controller_list(message.source, "disconnected");
-                    });
-                });
-
-                connection.addEventListener("icecandidate", (event) => {
-                    if (event.candidate) {
-                        send_message({
-                            type: "ice-candidate",
-                            source: synth_id,
-                            target: message.source,
-                            data: event.candidate,
-                        });
-                    }
-                });
-
-                await connection.setRemoteDescription(message.data);
-
-                if (peer.ice_candidates) {
-                    for (const candidate of peer.ice_candidates) {
-                        await connection.addIceCandidate(candidate);
-                    }
-                    peer.ice_candidates = [];
-                }
-
-                const answer = await connection.createAnswer();
-                await connection.setLocalDescription(answer);
-
-                send_message({
-                    type: "answer",
-                    source: synth_id,
-                    target: message.source,
-                    data: answer,
-                });
-            }
 
             // Handle touch data
             function handle_touch_data(data) {
@@ -519,35 +455,23 @@
                             lowerVowel[i].bw +
                             (upperVowel[i].bw - lowerVowel[i].bw) * fraction;
 
-                        // Frequency - use exponential ramp
+                        // Frequency - use setTargetAtTime for smooth transitions
                         const freqParam = fm_synth_node.parameters.get(
                             `formant${i}_freq`,
                         );
-                        // freqParam.cancelScheduledValues(now);
-                        freqParam.setValueAtTime(freqParam.value, now);
-                        freqParam.cancelScheduledValues(now);
-                        freqParam.exponentialRampToValueAtTime(
-                            freq,
-                            now + ramp_time,
-                        );
+                        freqParam.setTargetAtTime(freq, now, 0.03);
 
-                        // Amplitude - use linear ramp
+                        // Amplitude - use setTargetAtTime for smooth transitions
                         const ampParam = fm_synth_node.parameters.get(
                             `formant${i}_amp`,
                         );
-                        // ampParam.cancelScheduledValues(now);
-                        ampParam.setValueAtTime(ampParam.value, now);
-                        ampParam.cancelScheduledValues(now);
-                        ampParam.linearRampToValueAtTime(amp, now + ramp_time);
+                        ampParam.setTargetAtTime(amp, now, 0.03);
 
-                        // Bandwidth - use linear ramp
+                        // Bandwidth - use setTargetAtTime for smooth transitions
                         const bwParam = fm_synth_node.parameters.get(
                             `formant${i}_bw`,
                         );
-                        // bwParam.cancelScheduledValues(now);
-                        bwParam.setValueAtTime(bwParam.value, now);
-                        bwParam.cancelScheduledValues(now);
-                        bwParam.linearRampToValueAtTime(bw, now + ramp_time);
+                        bwParam.setTargetAtTime(bw, now, 0.03);
                     }
 
                     // Activate synthesis
@@ -631,6 +555,91 @@
                     } else if (!value && audio_context.state === "running") {
                         audio_context.suspend();
                     }
+                }
+            }
+
+            // Initiate connection to a controller
+            async function initiate_connection_to_controller(controller_id) {
+                console.log(`Initiating connection to controller ${controller_id}`);
+                
+                // Don't connect if we already have a connection
+                if (peers.has(controller_id)) {
+                    console.log(`Already connected to ${controller_id}`);
+                    return;
+                }
+                
+                try {
+                    const connection = new RTCPeerConnection(rtc_config);
+                    peers.set(controller_id, { connection, channels: {} });
+                    
+                    // Set up connection event handlers
+                    connection.addEventListener("icecandidate", (event) => {
+                        if (event.candidate) {
+                            send_message({
+                                type: "ice-candidate",
+                                source: synth_id,
+                                target: controller_id,
+                                data: event.candidate,
+                            });
+                        }
+                    });
+                    
+                    // Create data channel for parameters (match controller's expected channel)
+                    const channel = connection.createDataChannel("params", {
+                        ordered: false,
+                        maxRetransmits: 0
+                    });
+                    
+                    channel.addEventListener("open", () => {
+                        console.log(`Channel to ${controller_id} opened`);
+                        update_controller_list(controller_id, "connected");
+                    });
+                    
+                    channel.addEventListener("message", (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === "touch") {
+                                handle_touch_data(data);
+                            } else if (data.type === "ping") {
+                                // Respond to ping
+                                channel.send(
+                                    JSON.stringify({
+                                        type: "pong",
+                                        timestamp: data.timestamp,
+                                    }),
+                                );
+                            } else if (data.type === "pong") {
+                                // Handle pong (though synths typically don't receive pongs)
+                                console.log("Received pong with timestamp:", data.timestamp);
+                            }
+                        } catch (error) {
+                            console.error("Failed to parse channel data:", error);
+                        }
+                    });
+                    
+                    channel.addEventListener("close", () => {
+                        console.log(`Channel to ${controller_id} closed`);
+                        update_controller_list(controller_id, "disconnected");
+                    });
+                    
+                    peers.get(controller_id).channels.params = channel;
+                    
+                    // Create offer
+                    const offer = await connection.createOffer();
+                    await connection.setLocalDescription(offer);
+                    
+                    send_message({
+                        type: "offer",
+                        source: synth_id,
+                        target: controller_id,
+                        data: offer,
+                    });
+                    
+                    console.log(`Synth sent offer to controller ${controller_id}`);
+                    
+                } catch (error) {
+                    console.error(`Failed to connect to controller ${controller_id}:`, error);
+                    peers.delete(controller_id);
                 }
             }
 
