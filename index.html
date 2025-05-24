@@ -127,6 +127,7 @@
             let canvas = null;
             let canvas_ctx = null;
             let animation_id = null;
+            let wake_lock = null;
 
             // UI elements
             const status_el = document.getElementById("status");
@@ -267,7 +268,7 @@
                     window.location.protocol === "https:" ? "wss:" : "ws:";
                 ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
-                ws.addEventListener("open", () => {
+                ws.addEventListener("open", async () => {
                     console.log("Connected to server");
                     status_el.textContent = `Connected as ${synth_id}`;
 
@@ -282,6 +283,9 @@
                         source: synth_id,
                     });
                     console.log("Synth requested active controllers list");
+                    
+                    // Request wake lock when connected
+                    await request_wake_lock();
                 });
 
                 ws.addEventListener("message", async (event) => {
@@ -655,6 +659,44 @@
                 }
             }
 
+            // Wake lock functions
+            async function request_wake_lock() {
+                try {
+                    if ('wakeLock' in navigator) {
+                        wake_lock = await navigator.wakeLock.request('screen');
+                        console.log('Wake lock acquired');
+                    
+                        wake_lock.addEventListener('release', () => {
+                            console.log('Wake lock released');
+                            wake_lock = null;
+                        });
+                    } else {
+                        console.log('Wake Lock API not supported');
+                    }
+                } catch (error) {
+                    console.error('Failed to acquire wake lock:', error);
+                }
+            }
+        
+            async function release_wake_lock() {
+                if (wake_lock) {
+                    try {
+                        await wake_lock.release();
+                        wake_lock = null;
+                        console.log('Wake lock released manually');
+                    } catch (error) {
+                        console.error('Failed to release wake lock:', error);
+                    }
+                }
+            }
+        
+            // Re-acquire wake lock on visibility change
+            document.addEventListener('visibilitychange', async () => {
+                if (!document.hidden && !wake_lock) {
+                    await request_wake_lock();
+                }
+            });
+
             // Initialize network immediately
             async function init_network() {
                 await fetch_ice_servers();
@@ -676,6 +718,9 @@
                     document.addEventListener("click", init_audio_on_gesture, {
                         once: true,
                     });
+                } else {
+                    // Request wake lock after successful audio initialization
+                    await request_wake_lock();
                 }
             }
 

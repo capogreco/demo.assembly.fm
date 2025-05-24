@@ -206,6 +206,7 @@
         let sending_params = false
         let send_interval = null
         let current_touch = null
+        let wake_lock = null
         
         // UI elements
         const status_el = document.getElementById('status')
@@ -232,12 +233,50 @@
             }
         }
         
+        // Wake lock functions
+        async function request_wake_lock() {
+            try {
+                if ('wakeLock' in navigator) {
+                    wake_lock = await navigator.wakeLock.request('screen')
+                    console.log('Wake lock acquired')
+                    
+                    wake_lock.addEventListener('release', () => {
+                        console.log('Wake lock released')
+                        wake_lock = null
+                    })
+                } else {
+                    console.log('Wake Lock API not supported')
+                }
+            } catch (error) {
+                console.error('Failed to acquire wake lock:', error)
+            }
+        }
+        
+        async function release_wake_lock() {
+            if (wake_lock) {
+                try {
+                    await wake_lock.release()
+                    wake_lock = null
+                    console.log('Wake lock released manually')
+                } catch (error) {
+                    console.error('Failed to release wake lock:', error)
+                }
+            }
+        }
+        
+        // Re-acquire wake lock on visibility change
+        document.addEventListener('visibilitychange', async () => {
+            if (!document.hidden && !wake_lock) {
+                await request_wake_lock()
+            }
+        })
+        
         // Connect to WebSocket
         function connect_websocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`)
             
-            ws.addEventListener('open', () => {
+            ws.addEventListener('open', async () => {
                 console.log('Connected to server')
                 status_el.textContent = 'Connected'
                 
@@ -255,6 +294,9 @@
                 }, 20000) // Send heartbeat every 20 seconds
                 
                 console.log(`Controller registered and heartbeat started`)
+                
+                // Request wake lock when connected
+                await request_wake_lock()
             })
             
             ws.addEventListener('message', async (event) => {
